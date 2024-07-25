@@ -1,0 +1,5 @@
+.env
+stats-venv/
+__pycache__/
+daily_totals.png
+subreddit_totals.png

@@ -1,0 +1,5 @@
+praw
+duckdb
+python-dotenv
+pandas
+matplotlib
