@@ -25,8 +25,8 @@ reddit = praw.Reddit(
     password=os.getenv("REDDIT_PASSWORD")
 )
 
-DEBUG = True  # Set this to False to exclude test subreddits
-EXCLUDED_SUBREDDITS = ['FundraisersOnReddit', 'fundraisersTests', 'SnoowyDayFund']
+DEBUG = False  # Set this to False to exclude test subreddits
+EXCLUDED_SUBREDDITS = ['FundraisersOnReddit', 'fundraisersTests', 'SnoowyDayFund', 'cedartest', 'axolotl_playground']
 FUNDRAISERS_APP_USER_ID = "14u2cffx3h"
 
 def main():
@@ -110,15 +110,16 @@ def main():
 
 def calculate_top_fundraisers(con, limit=10):
     query = """
-    WITH latest_fundraiser AS (
+    WITH latest_daily_fundraiser AS (
         SELECT FundraiserID, Subreddit, Raised,
-               ROW_NUMBER() OVER (PARTITION BY FundraiserID ORDER BY Timestamp DESC) as rn
+               ROW_NUMBER() OVER (PARTITION BY FundraiserID, DATE_TRUNC('day', Timestamp) ORDER BY Timestamp DESC) as rn
         FROM fundraisers
         WHERE ? OR Subreddit NOT IN (SELECT unnest(?))
     )
-    SELECT FundraiserID, Raised / 100.0 as MaxRaised, Subreddit
-    FROM latest_fundraiser
+    SELECT FundraiserID, MAX(Raised) / 100.0 as MaxRaised, Subreddit
+    FROM latest_daily_fundraiser
     WHERE rn = 1
+    GROUP BY FundraiserID, Subreddit
     ORDER BY MaxRaised DESC
     LIMIT ?
     """
@@ -129,21 +130,21 @@ def calculate_top_fundraisers(con, limit=10):
 
 def create_daily_totals_chart(con):
     query = """
-    WITH latest_fundraiser AS (
-        SELECT FundraiserID, Raised, Timestamp,
-               ROW_NUMBER() OVER (PARTITION BY FundraiserID ORDER BY Timestamp DESC) as rn
+    WITH latest_daily_fundraiser AS (
+        SELECT FundraiserID, Raised, DATE_TRUNC('day', Timestamp) as Date,
+               ROW_NUMBER() OVER (PARTITION BY FundraiserID, DATE_TRUNC('day', Timestamp) ORDER BY Timestamp DESC) as rn
         FROM fundraisers
         WHERE ? OR Subreddit NOT IN (SELECT unnest(?))
     )
-    SELECT date_trunc('day', Timestamp) as Date, SUM(Raised) / 100.0 as DailyTotal
-    FROM latest_fundraiser
+    SELECT Date, SUM(Raised) / 100.0 as DailyTotal
+    FROM latest_daily_fundraiser
     WHERE rn = 1
-    GROUP BY date_trunc('day', Timestamp)
+    GROUP BY Date
     ORDER BY Date
     """
     results = con.execute(query, [DEBUG, EXCLUDED_SUBREDDITS]).fetchall()
     
-    print(f"Number of results: {len(results)}")  # Debugging line
+    print(f"Number of reports: {len(results)}")  # Debugging line
     
     if not results:
         print("No data returned from the query.")
@@ -233,40 +234,47 @@ def calculate_subreddit_growth(con):
                ROW_NUMBER() OVER (PARTITION BY FundraiserID ORDER BY Timestamp DESC) as rn
         FROM fundraisers
         WHERE ? OR Subreddit NOT IN (SELECT unnest(?))
+    ),
+    subreddit_stats AS (
+        SELECT lf.Subreddit, 
+               MIN(DATE_TRUNC('day', Timestamp)) as FirstDay,
+               MAX(DATE_TRUNC('day', Timestamp)) as LastDay,
+               COUNT(DISTINCT DATE_TRUNC('day', Timestamp)) as DaysActive,
+               COUNT(DISTINCT lf.FundraiserID) as TotalFundraisers,
+               SUM(CASE WHEN lf.rn = 1 THEN lf.Raised ELSE 0 END) / 100.0 as TotalRaised
+        FROM latest_fundraiser lf
+        GROUP BY lf.Subreddit
     )
-    SELECT Subreddit, 
-           MIN(Timestamp) as FirstDay,
-           MAX(Timestamp) as LastDay,
-           DATEDIFF('day', MIN(Timestamp), MAX(Timestamp)) as DaysSinceStart,
-           COUNT(DISTINCT FundraiserID) as TotalFundraisers,
-           SUM(Raised) / 100.0 as TotalRaised
-    FROM latest_fundraiser
-    WHERE rn = 1
-    GROUP BY Subreddit
+    SELECT *,
+           CASE WHEN DaysActive > 0 THEN TotalRaised / DaysActive ELSE 0 END as AvgRaisedPerDay
+    FROM subreddit_stats
     ORDER BY TotalRaised DESC
     """
     results = con.execute(query, [DEBUG, EXCLUDED_SUBREDDITS]).fetchall()
-    
+    return results
+
+def print_subreddit_growth_and_performance(results):
     print("\nSubreddit Growth and Performance:")
-    for subreddit, first_day, last_day, days, total_fundraisers, total_raised in results:
+    for subreddit, first_day, last_day, days_active, total_fundraisers, total_raised, avg_raised_per_day in results:
         print(f"r/{subreddit}:")
         print(f"  First fundraiser: {first_day}")
-        print(f"  Days active: {days}")
+        print(f"  Last fundraiser: {last_day}")
+        print(f"  Days with reports: {days_active}")
         print(f"  Total fundraisers: {total_fundraisers}")
         print(f"  Total raised: ${total_raised:.2f}")
-        if days > 0:
-            print(f"  Average raised per day: ${total_raised / days:.2f}")
-        else:
-            print("  Average raised per day: N/A (less than one day of data)")
+        print(f"  Average raised per day: ${avg_raised_per_day:.2f}")
         print()
 
-def print_all_rows(con):
+def print_all_rows(con, limit=None):
     query = """
     SELECT PostID, FundraiserID, Raised / 100.0 as RaisedDollars, Timestamp, Subreddit
     FROM fundraisers
     WHERE ? OR Subreddit NOT IN (SELECT unnest(?))
     ORDER BY Timestamp DESC
     """
+    if limit is not None:
+        query += f" LIMIT {limit}"
+    
     results = con.execute(query, [DEBUG, EXCLUDED_SUBREDDITS]).fetchall()
     
     print("\nAll Fundraiser Entries:")
@@ -281,12 +289,13 @@ def run_stats_suite(con):
     calculate_top_fundraisers(con)
     create_daily_totals_chart(con)
     create_subreddit_bar_chart(con)
-    calculate_subreddit_growth(con)
+    results = calculate_subreddit_growth(con)
+    print_subreddit_growth_and_performance(results)
+    print_all_rows(con, limit=10)
     print("\n--- Stats Suite Complete ---")
 
 if __name__ == "__main__":
-    #main()
+    main()
     
     with closing(duckdb.connect('fundraisers.db')) as con:
         run_stats_suite(con)
-        #print_all_rows(con)
